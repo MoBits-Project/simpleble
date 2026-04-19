@@ -17,6 +17,7 @@
 #include <atomic>
 #include <map>
 #include <memory>
+#include <thread>
 
 using namespace winrt::Windows::Devices::Bluetooth;
 using namespace winrt::Windows::Devices::Bluetooth::GenericAttributeProfile;
@@ -103,6 +104,40 @@ class PeripheralWindows : public PeripheralBase {
     uint16_t mtu_;
     bool connectable_;
     winrt::event_token connection_status_changed_token_;
+    // Set when ConnectionParametersChanged is subscribed (Windows 10 2004+).
+    // Used to re-assert ThroughputOptimized whenever Windows renegotiates the
+    // connection interval — which it does aggressively every time a new BLE
+    // device connects, extending older devices' intervals from ~7.5 ms to
+    // ~67 ms (drops notify rate from ~100 Hz to ~15 Hz).
+    winrt::event_token connection_params_changed_token_;
+
+    // Preferred-connection-parameters request. Must stay alive (keeping the
+    // shared_ptr / WinRT handle) to keep the preference asserted with Windows.
+    BluetoothLEPreferredConnectionParametersRequest preferred_connection_params_request_{nullptr};
+
+    // Watchdog thread that periodically re-asserts ThroughputOptimized. Belt-
+    // and-suspenders fallback in case ConnectionParametersChanged events are
+    // delivered late or not at all on a given driver / Windows build.
+    std::thread conn_param_watchdog_thread_;
+    std::atomic<bool> conn_param_watchdog_running_{false};
+
+    // Target max interval in milliseconds (ThroughputOptimized max is 15 ms).
+    // When the observed ConnectionInterval exceeds this, we re-request.
+    static constexpr int64_t kPreferredMaxIntervalMs = 20;
+
+    // Re-request ThroughputOptimized connection parameters if the current
+    // connection interval exceeds the target. Safe to call concurrently.
+    // Must be invoked via MtaManager::execute_sync (accesses device_).
+    void _reapply_preferred_connection_parameters_locked_mta();
+    // Public-facing trampoline: submits the reapply task to MtaManager and
+    // returns once it has executed.
+    void _reapply_preferred_connection_parameters();
+    // Unregister the ConnectionParametersChanged handler and release the
+    // preferred-parameters request. Must run on MTA.
+    void _teardown_connection_parameters_watch_locked_mta();
+    // Start / stop the watchdog thread.
+    void _conn_param_watchdog_start();
+    void _conn_param_watchdog_stop();
 
     // Internal state for deferred (non-blocking) disconnect mode
     // Only active when Config::WinRT::use_deferred_disconnect == true
