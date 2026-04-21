@@ -115,6 +115,14 @@ class PeripheralWindows : public PeripheralBase {
     // shared_ptr / WinRT handle) to keep the preference asserted with Windows.
     BluetoothLEPreferredConnectionParametersRequest preferred_connection_params_request_{nullptr};
 
+    // Explicit long-lived GattSession held for this device. Created via
+    // GattSession::FromDeviceIdAsync BEFORE GATT discovery so that we can assert
+    // MaintainConnection(true) on the SAME session object that Windows will use
+    // for the actual connection — as opposed to `service.Session()` which
+    // returns a temporary wrapper whose MaintainConnection setting appears to
+    // get reset when the wrapper is released.
+    GattSession gatt_session_{nullptr};
+
     // Watchdog thread that periodically re-asserts ThroughputOptimized. Belt-
     // and-suspenders fallback in case ConnectionParametersChanged events are
     // delivered late or not at all on a given driver / Windows build.
@@ -155,7 +163,11 @@ class PeripheralWindows : public PeripheralBase {
     std::map<uint16_t, SimpleBLE::ByteArray> manufacturer_data_;
     std::map<BluetoothUUID, SimpleBLE::ByteArray> service_data_;
 
-    bool _attempt_connect();
+    // use_cached=true => pass BluetoothCacheMode::Cached to GetGattServicesAsync
+    // etc. Paired devices have their service structure persisted by Windows, so
+    // Cached mode often succeeds on reconnect where Uncached fails (observed
+    // with certain third-party BLE dongles).
+    bool _attempt_connect(bool use_cached = false);
 
     gatt_characteristic_t& _fetch_characteristic(const BluetoothUUID& service_uuid,
                                                  const BluetoothUUID& characteristic_uuid);

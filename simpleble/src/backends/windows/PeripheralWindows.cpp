@@ -115,16 +115,120 @@ void PeripheralWindows::connect() {
 
     MtaManager::get().execute_sync([this]() {
         device_ = async_get(BluetoothLEDevice::FromBluetoothAddressAsync(_str_to_mac_address(address_)));
+
+        // PRE-CONNECT 1: establish a long-lived GattSession for this device and
+        // pin MaintainConnection(true) on it BEFORE any GATT discovery. This is
+        // the session object Windows uses internally, so pinning it here keeps
+        // the BLE link active even while other devices are being added, which in
+        // turn discourages the stack from renegotiating our interval downward.
+        try {
+            auto bt_id = device_.BluetoothDeviceId();
+            gatt_session_ = async_get(GattSession::FromDeviceIdAsync(bt_id));
+            if (gatt_session_ != nullptr) {
+                gatt_session_.MaintainConnection(true);
+                SIMPLEBLE_LOG_INFO(
+                    fmt::format("[{}] pre-connect GattSession pinned with MaintainConnection=true",
+                                address_));
+            }
+        } catch (const winrt::hresult_error& e) {
+            SIMPLEBLE_LOG_WARN(
+                fmt::format("[{}] GattSession::FromDeviceIdAsync failed: 0x{:08x} - {}",
+                            address_, (uint32_t)e.code().value, winrt::to_string(e.message())));
+        } catch (...) {
+            SIMPLEBLE_LOG_WARN(
+                fmt::format("[{}] GattSession::FromDeviceIdAsync failed: unknown exception",
+                            address_));
+        }
+
+        // PRE-CONNECT 2: request ThroughputOptimized BEFORE GATT discovery
+        // initiates the connection. The preference is stored by Windows against
+        // this device handle and is used when the initial connection-parameter
+        // negotiation occurs with the peripheral — as opposed to requesting
+        // afterwards, which only triggers a *re-*negotiation that the stack is
+        // free to ignore.
+        try {
+            preferred_connection_params_request_ = device_.RequestPreferredConnectionParameters(
+                BluetoothLEPreferredConnectionParameters::ThroughputOptimized());
+            SIMPLEBLE_LOG_INFO(
+                fmt::format("[{}] pre-connect ThroughputOptimized request issued", address_));
+        } catch (...) {
+            SIMPLEBLE_LOG_WARN(
+                fmt::format("[{}] pre-connect ThroughputOptimized request THREW (not supported)",
+                            address_));
+        }
     });
 
     // Attempt to connect to the device.
-    for (size_t i = 0; i < 3; i++) {
-        if (_attempt_connect()) {
+    //
+    // IMPORTANT: _attempt_connect() populates gatt_map_ via GATT service
+    // discovery. If it fails (GetGattServicesAsync returns non-Success) but
+    // Windows has already opened the link-layer connection (so is_connected()
+    // returns true), proceeding here would fire callback_on_connected_ with
+    // an EMPTY gatt_map_ — every subsequent write/notify would then fail with
+    // CharacteristicNotFound, manifesting as "failed to send device type" /
+    // "notify subscribe failed" in the caller.
+    //
+    // This happens in practice on reconnect with certain Bluetooth dongles:
+    // the link opens fine, but the first Uncached service discovery returns
+    // empty. As a fallback we retry with Cached mode — the service structure
+    // is persisted across app restarts for paired devices, so this works even
+    // when a fresh discovery does not.
+    bool discovery_ok = false;
+    for (size_t i = 0; i < 4; i++) {
+        if (_attempt_connect(i >= 2 /* use_cached */)) {
+            discovery_ok = true;
             break;
+        }
+        // Brief backoff to let the BLE stack settle between tries.
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+
+        // After 2 Uncached failures we re-open the device handle before the
+        // Cached attempts. On a second app start Windows sometimes hands back
+        // a BluetoothLEDevice tied to stale state from the previous (now dead)
+        // process — closing and re-acquiring it via FromBluetoothAddressAsync
+        // gives us a fresh handle.
+        if (i == 1) {
+            SIMPLEBLE_LOG_WARN(
+                fmt::format("[{}] Uncached discovery failed; re-opening device handle before Cached retry",
+                            address_));
+            try {
+                MtaManager::get().execute_sync([this]() {
+                    _teardown_connection_parameters_watch_locked_mta();
+                    if (device_ != nullptr) {
+                        try { device_.Close(); } catch (...) {}
+                        device_ = nullptr;
+                    }
+                    // Re-open the device handle.
+                    device_ = async_get(BluetoothLEDevice::FromBluetoothAddressAsync(
+                        _str_to_mac_address(address_)));
+                    if (device_ == nullptr) return;
+
+                    // Re-pin session + re-issue ThroughputOptimized request on
+                    // the fresh handle (the previous request object was released
+                    // with the old handle by _teardown_...).
+                    try {
+                        auto bt_id = device_.BluetoothDeviceId();
+                        gatt_session_ = async_get(GattSession::FromDeviceIdAsync(bt_id));
+                        if (gatt_session_ != nullptr) {
+                            gatt_session_.MaintainConnection(true);
+                        }
+                    } catch (...) {}
+                    try {
+                        preferred_connection_params_request_ = device_.RequestPreferredConnectionParameters(
+                            BluetoothLEPreferredConnectionParameters::ThroughputOptimized());
+                    } catch (...) {}
+                });
+            } catch (...) {}
+            std::this_thread::sleep_for(std::chrono::milliseconds(150));
         }
     }
 
-    if (is_connected()) {
+    if (!discovery_ok) {
+        SIMPLEBLE_LOG_WARN(
+            fmt::format("[{}] GATT service discovery failed after all retries", address_));
+    }
+
+    if (discovery_ok && is_connected()) {
         MtaManager::get().execute_sync([this]() {
             connection_status_changed_token_ = device_.ConnectionStatusChanged(
                 [this](const BluetoothLEDevice device, const auto args) {
@@ -184,7 +288,24 @@ void PeripheralWindows::connect() {
         if (SimpleBLE::Config::WinRT::use_deferred_disconnect) {
             connection_state_ = ConnectionState::Disconnected;
         }
-        throw SimpleBLE::Exception::OperationFailed("Failed to connect to device.");
+        // Release any preconnect state we pinned so the next retry starts clean
+        // (pinned GattSession + ThroughputOptimized request). If we skip this,
+        // Windows may hold the previous session open and the next FromDeviceIdAsync
+        // returns a handle bound to a half-connected state.
+        try {
+            MtaManager::get().execute_sync([this]() {
+                _teardown_connection_parameters_watch_locked_mta();
+                if (device_ != nullptr) {
+                    try { device_.Close(); } catch (...) {}
+                }
+                device_ = nullptr;
+            });
+        } catch (...) {}
+
+        const std::string msg = discovery_ok
+            ? "Failed to connect to device."
+            : "GATT service discovery failed (device may be reachable but services could not be enumerated).";
+        throw SimpleBLE::Exception::OperationFailed(msg);
     }
 }
 
@@ -492,14 +613,37 @@ void PeripheralWindows::_subscribe(BluetoothUUID const& service, BluetoothUUID c
     });
 }
 
-bool PeripheralWindows::_attempt_connect() {
+bool PeripheralWindows::_attempt_connect(bool use_cached) {
     gatt_map_.clear();
 
-    return MtaManager::get().execute_sync<bool>([this]() {
+    const BluetoothCacheMode cache_mode =
+        use_cached ? BluetoothCacheMode::Cached : BluetoothCacheMode::Uncached;
+
+    // Convert any WinRT exception into a `return false` with a WARN log so the
+    // retry loop in connect() can escalate (and so we can see exactly what's
+    // failing in the user's logs, which otherwise just show the final
+    // "GATT service discovery failed after all retries" message).
+    try {
+        return MtaManager::get().execute_sync<bool>([this, cache_mode, use_cached]() {
+        if (device_ == nullptr) {
+            SIMPLEBLE_LOG_WARN(
+                fmt::format("[{}] _attempt_connect: device_ is null", address_));
+            return false;
+        }
         // We need to cache all services, characteristics and descriptors in the class, else
         // the underlying objects will be garbage collected.
-        auto services_result = async_get(device_.GetGattServicesAsync(BluetoothCacheMode::Uncached));
+        auto services_result = async_get(device_.GetGattServicesAsync(cache_mode));
         if (services_result.Status() != GattCommunicationStatus::Success) {
+            SIMPLEBLE_LOG_WARN(
+                fmt::format("[{}] GetGattServicesAsync failed (cached={}): status={}",
+                            address_, use_cached,
+                            static_cast<int>(services_result.Status())));
+            return false;
+        }
+        if (services_result.Services().Size() == 0) {
+            SIMPLEBLE_LOG_WARN(
+                fmt::format("[{}] GetGattServicesAsync returned 0 services (cached={})",
+                            address_, use_cached));
             return false;
         }
 
@@ -523,9 +667,15 @@ bool PeripheralWindows::_attempt_connect() {
             // Fetch the service UUID
             std::string service_uuid = guid_to_uuid(service.Uuid());
 
-            // Fetch the service characteristics
-            auto characteristics_result = async_get(service.GetCharacteristicsAsync(BluetoothCacheMode::Uncached));
+            // Fetch the service characteristics (same cache mode as the
+            // services fetch for consistency; without this a Cached services
+            // fetch but Uncached characteristics fetch can re-fail mid-way).
+            auto characteristics_result = async_get(service.GetCharacteristicsAsync(cache_mode));
             if (characteristics_result.Status() != GattCommunicationStatus::Success) {
+                SIMPLEBLE_LOG_WARN(
+                    fmt::format("[{}] GetCharacteristicsAsync failed (cached={}, service={}): status={}",
+                                address_, use_cached, service_uuid,
+                                static_cast<int>(characteristics_result.Status())));
                 return false;
             }
 
@@ -539,9 +689,13 @@ bool PeripheralWindows::_attempt_connect() {
                 // Fetch the characteristic UUID
                 std::string characteristic_uuid = guid_to_uuid(characteristic.Uuid());
 
-                // Fetch the characteristic descriptors
-                auto descriptors_result = async_get(characteristic.GetDescriptorsAsync(BluetoothCacheMode::Uncached));
+                // Fetch the characteristic descriptors (same cache mode).
+                auto descriptors_result = async_get(characteristic.GetDescriptorsAsync(cache_mode));
                 if (descriptors_result.Status() != GattCommunicationStatus::Success) {
+                    SIMPLEBLE_LOG_WARN(
+                        fmt::format("[{}] GetDescriptorsAsync failed (cached={}, char={}): status={}",
+                                    address_, use_cached, characteristic_uuid,
+                                    static_cast<int>(descriptors_result.Status())));
                     return false;
                 }
 
@@ -568,7 +722,23 @@ bool PeripheralWindows::_attempt_connect() {
         }
 
         return true;
-    });
+        });
+    } catch (const SimpleBLE::Exception::WinRTException& e) {
+        SIMPLEBLE_LOG_WARN(
+            fmt::format("[{}] _attempt_connect WinRT exception (cached={}): {}",
+                        address_, use_cached, e.what()));
+        return false;
+    } catch (const std::exception& e) {
+        SIMPLEBLE_LOG_WARN(
+            fmt::format("[{}] _attempt_connect std::exception (cached={}): {}",
+                        address_, use_cached, e.what()));
+        return false;
+    } catch (...) {
+        SIMPLEBLE_LOG_WARN(
+            fmt::format("[{}] _attempt_connect unknown exception (cached={})",
+                        address_, use_cached));
+        return false;
+    }
 }
 
 // ─── Connection-parameter watchdog (Windows multi-device notify-rate fix) ───
@@ -582,27 +752,33 @@ bool PeripheralWindows::_attempt_connect() {
 
 void PeripheralWindows::_reapply_preferred_connection_parameters_locked_mta() {
     if (device_ == nullptr) return;
-    try {
-        // Read the current interval if possible (Windows 10 2004+) and skip
-        // the re-request when it is already within the target range, to avoid
-        // spamming the BLE stack with identical requests.
-        auto params = device_.ConnectionParameters();
-        auto interval_ts = params.ConnectionInterval();
-        auto interval_ms =
-            std::chrono::duration_cast<std::chrono::milliseconds>(interval_ts).count();
-        if (interval_ms > 0 && interval_ms <= kPreferredMaxIntervalMs) {
-            return;  // already tight enough
-        }
-    } catch (...) {
-        // ConnectionParameters may not be available; fall through and just
-        // re-request unconditionally.
-    }
 
+    // Reassert MaintainConnection(true) on the persistent session. It's a
+    // no-op if already set, but catches the case where Windows silently
+    // cleared it during a new-device negotiation.
+    try {
+        if (gatt_session_ != nullptr) {
+            gatt_session_.MaintainConnection(true);
+        }
+    } catch (...) {}
+
+    // Diagnostic: distinguish between "request accepted by Windows" (no throw)
+    // and "request rejected" (throw). If the request is accepted but the notify
+    // rate stays at 15 Hz, the BLE adapter firmware itself is rejecting tighter
+    // intervals (= hardware limitation, not fixable in software).
     try {
         preferred_connection_params_request_ = device_.RequestPreferredConnectionParameters(
             BluetoothLEPreferredConnectionParameters::ThroughputOptimized());
+        // SIMPLEBLE_LOG_INFO(
+        //     fmt::format("[{}] reapply ThroughputOptimized: request accepted by Windows",
+        //                 address_));
+    } catch (const winrt::hresult_error& e) {
+        // SIMPLEBLE_LOG_WARN(
+        //     fmt::format("[{}] reapply ThroughputOptimized: hresult_error 0x{:08x} - {}",
+        //                 address_, (uint32_t)e.code().value, winrt::to_string(e.message())));
     } catch (...) {
-        // Not supported on this adapter / driver; give up silently.
+        // SIMPLEBLE_LOG_WARN(
+        //     fmt::format("[{}] reapply ThroughputOptimized: unknown exception", address_));
     }
 }
 
@@ -625,6 +801,16 @@ void PeripheralWindows::_teardown_connection_parameters_watch_locked_mta() {
     // Dropping the request object tells Windows we no longer need the
     // preference held. Safe to call repeatedly.
     preferred_connection_params_request_ = nullptr;
+
+    // Release the persistent GattSession. Releasing it also clears
+    // MaintainConnection, letting Windows reclaim the resources.
+    if (gatt_session_ != nullptr) {
+        try {
+            gatt_session_.MaintainConnection(false);
+            gatt_session_.Close();
+        } catch (...) {}
+        gatt_session_ = nullptr;
+    }
 }
 
 void PeripheralWindows::_conn_param_watchdog_start() {
