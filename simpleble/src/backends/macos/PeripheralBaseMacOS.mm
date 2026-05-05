@@ -354,7 +354,21 @@
             [self.peripheral writeValue:payload forCharacteristic:characteristic type:CBCharacteristicWriteWithResponse];
         }
 
-        WAIT_UNTIL_FALSE(self, task.pending);
+        // 一時的な radio congestion で write response が返らないケースに備えて 2 秒で打ち切る。
+        WAIT_UNTIL_FALSE_WITH_TIMEOUT(self, task.pending, 2.0);
+
+        BOOL stillPending = NO;
+        @synchronized(self) {
+            stillPending = task.pending;
+            if (stillPending) {
+                task.pending = NO;
+            }
+        }
+
+        if (stillPending) {
+            throw SimpleBLE::Exception::OperationFailed(
+                "Characteristic " + std::string([characteristic.UUID.UUIDString UTF8String]) + " Write Request timed out");
+        }
 
         if (task.error != nil) {
             [self throwBasedOnError:task.error withFormat:@"Characteristic %@ Write Request", characteristic.UUID];
@@ -404,7 +418,22 @@
             [self.peripheral setNotifyValue:YES forCharacteristic:characteristic];
         }
 
-        WAIT_UNTIL_FALSE(self, task.pending);
+        // CCCD write が反映されないと以後 notify が一切来なくなるので、長過ぎない範囲で
+        // タイムアウトを入れる。2 秒は congestion 復帰でも十分な余裕。
+        WAIT_UNTIL_FALSE_WITH_TIMEOUT(self, task.pending, 2.0);
+
+        BOOL stillPending = NO;
+        @synchronized(self) {
+            stillPending = task.pending;
+            if (stillPending) {
+                task.pending = NO;
+            }
+        }
+
+        if (stillPending) {
+            throw SimpleBLE::Exception::OperationFailed(
+                "Characteristic " + std::string([characteristic.UUID.UUIDString UTF8String]) + " Notify/Indicate timed out");
+        }
 
         if (!characteristic.isNotifying || task.error != nil) {
             [self throwBasedOnError:task.error withFormat:@"Characteristic %@ Notify/Indicate", characteristic.UUID];
