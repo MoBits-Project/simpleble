@@ -44,4 +44,29 @@ static auto async_get(async_t const& async) {
     }
 }
 
+// Adapter discovery and ordinary I/O keep the generous default timeout above.
+// Connection establishment needs a shorter explicit bound because Windows can
+// otherwise leave every uncached GATT retry pending for ten seconds while the
+// peripheral is offline.
+template <typename async_t>
+static auto async_get_for(async_t const& async, uint32_t timeout_ms) {
+    if (async.Status() == Foundation::AsyncStatus::Started) {
+        wait_for_completed(async, timeout_ms);
+    }
+    if (async.Status() == Foundation::AsyncStatus::Started) {
+        try {
+            async.Cancel();
+        } catch (...) {
+        }
+        throw SimpleBLE::Exception::OperationFailed("WinRT async operation timed out");
+    }
+    try {
+        return async.GetResults();
+    } catch (const winrt::hresult_error& err) {
+        throw SimpleBLE::Exception::WinRTException(err.code().value, winrt::to_string(err.message()));
+    } catch (const std::exception& err) {
+        throw SimpleBLE::Exception::BaseException(err.what());
+    }
+}
+
 }  // namespace SimpleBLE

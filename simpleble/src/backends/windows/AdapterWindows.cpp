@@ -18,6 +18,7 @@
 #include "winrt/base.h"
 
 #include <algorithm>
+#include <cctype>
 #include <iostream>
 #include <iterator>
 #include <memory>
@@ -55,12 +56,19 @@ AdapterWindows::~AdapterWindows() {
     MtaManager::get().execute_sync([this]() {
         scanner_.Stop();
 
+        if (radio_state_changed_token_) {
+            radio_.StateChanged(radio_state_changed_token_);
+            radio_state_changed_token_ = {};
+        }
+
         if (scanner_received_token_) {
             scanner_.Received(scanner_received_token_);
+            scanner_received_token_ = {};
         }
 
         if (scanner_stopped_token_) {
             scanner_.Stopped(scanner_stopped_token_);
+            scanner_stopped_token_ = {};
         }
     });
 }
@@ -152,9 +160,19 @@ SharedPtrVector<PeripheralBase> AdapterWindows::get_paired_peripherals() {
     return MtaManager::get().execute_sync<SharedPtrVector<PeripheralBase>>([this]() {
         SharedPtrVector<PeripheralBase> peripherals;
         winrt::hstring aqs_filter = BluetoothLEDevice::GetDeviceSelectorFromPairingState(true);
-        auto dev_info_collection = async_get(Devices::Enumeration::DeviceInformation::FindAllAsync(aqs_filter));
+        auto dev_info_collection =
+            async_get(Devices::Enumeration::DeviceInformation::FindAllAsync(aqs_filter));
+        std::string adapter_prefix =
+            "bluetoothle#bluetoothle" + _mac_address_to_str(adapter_.BluetoothAddress()) + "-";
 
         for (const auto& dev_info : dev_info_collection) {
+            std::string device_id = winrt::to_string(dev_info.Id());
+            std::transform(device_id.begin(), device_id.end(), device_id.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            // The pairing selector is machine-wide and also returns records
+            // owned by unplugged Bluetooth adapters. Opening those IDs raises
+            // ERROR_INVALID_PARAMETER and can obscure the usable adapter.
+            if (device_id.rfind(adapter_prefix, 0) != 0) continue;
             try {
                 BluetoothLEDevice device = async_get(BluetoothLEDevice::FromIdAsync(dev_info.Id()));
                 if (device == nullptr) {
@@ -172,10 +190,6 @@ SharedPtrVector<PeripheralBase> AdapterWindows::get_paired_peripherals() {
                 peripherals.push_back(this->peripherals_.at(address));
             } catch (const Exception::WinRTException& e){
                 SIMPLEBLE_LOG_ERROR(fmt::format("WinRT error processing paired device {} : {}", winrt::to_string(dev_info.Id()), e.what()));
-
-                // NOTE: For debugging purposes, we'll print the error message and continue.
-                fmt::print("WinRT error processing paired device {} : {}", winrt::to_string(dev_info.Id()), e.what());
-                //throw Exception::WinRTException(e.code().value, winrt::to_string(e.message()));
                 continue;
             }
         }
@@ -229,10 +243,13 @@ void AdapterWindows::_scan_stopped_callback() {
 }
 
 void AdapterWindows::_scan_received_callback(advertising_data_t data) {
-    if (this->peripherals_.count(data.mac_address) == 0) {
-        // If the incoming peripheral has never been seen before, create and save a reference to it.
+    if (this->peripherals_.count(data.mac_address) == 0 ||
+        this->seen_peripherals_.count(data.mac_address) == 0) {
+        // Refresh the wrapper on the first advertisement of each scan. A failed
+        // Windows connection closes its BluetoothLEDevice; reusing the old map
+        // entry makes every later reconnect operate on that dead object.
         auto base_peripheral = std::make_shared<PeripheralWindows>(data);
-        this->peripherals_.insert(std::make_pair(data.mac_address, base_peripheral));
+        this->peripherals_[data.mac_address] = base_peripheral;
     }
 
     // Update the received advertising data.

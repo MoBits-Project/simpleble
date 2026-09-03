@@ -52,9 +52,6 @@ PeripheralWindows::PeripheralWindows(advertising_data_t advertising_data) {
 }
 
 PeripheralWindows::~PeripheralWindows() {
-    // Stop the watchdog first so it can no longer call back into `this`.
-    _conn_param_watchdog_stop();
-
     if (device_ != nullptr) {
         MtaManager::get().execute_sync([this]() {
             _teardown_connection_parameters_watch_locked_mta();
@@ -106,6 +103,7 @@ bool PeripheralWindows::is_disconnect_pending() const noexcept {
 }
 
 void PeripheralWindows::connect() {
+    constexpr uint32_t kConnectOperationTimeoutMs = 3000;
     if (SimpleBLE::Config::WinRT::use_deferred_disconnect) {
         if (connection_state_ == ConnectionState::Disconnecting) {
             throw SimpleBLE::Exception::OperationFailed("Device is still disconnecting");
@@ -113,8 +111,19 @@ void PeripheralWindows::connect() {
         connection_state_ = ConnectionState::Connecting;
     }
 
-    MtaManager::get().execute_sync([this]() {
-        device_ = async_get(BluetoothLEDevice::FromBluetoothAddressAsync(_str_to_mac_address(address_)));
+    MtaManager::get().execute_sync([this, kConnectOperationTimeoutMs]() {
+        // get_paired_peripherals() already gives us a BluetoothLEDevice tied
+        // to the owning radio. Keep that handle: resolving the same address
+        // again can fail while Windows' advertisement watcher is recovering,
+        // which made reconnect impossible even though the OS pairing record
+        // was valid. Scanned peripherals do not have a device handle yet and
+        // still need the address-based lookup.
+        const bool reused_paired_handle = device_ != nullptr;
+        if (!reused_paired_handle) {
+            device_ = async_get_for(
+                BluetoothLEDevice::FromBluetoothAddressAsync(_str_to_mac_address(address_)),
+                kConnectOperationTimeoutMs);
+        }
 
         // PRE-CONNECT: request ThroughputOptimized BEFORE GATT discovery
         // initiates the connection. The preference is stored by Windows
@@ -132,15 +141,22 @@ void PeripheralWindows::connect() {
         // was stuck. service.Session().MaintainConnection(true) runs
         // post-discovery inside _attempt_connect() for each service, which is
         // both sufficient for the multi-device rate fix and safe on reconnect.
-        try {
-            preferred_connection_params_request_ = device_.RequestPreferredConnectionParameters(
-                BluetoothLEPreferredConnectionParameters::ThroughputOptimized());
-            SIMPLEBLE_LOG_INFO(
-                fmt::format("[{}] pre-connect ThroughputOptimized request issued", address_));
-        } catch (...) {
-            SIMPLEBLE_LOG_WARN(
-                fmt::format("[{}] pre-connect ThroughputOptimized request THREW (not supported)",
-                            address_));
+        // A DeviceInformation-derived paired handle can exist while the radio
+        // is still restoring that device after wake. Requesting preferred
+        // parameters on that dormant handle has caused Windows to leave the
+        // following uncached GATT request pending. Let GATT establish the link
+        // first; the post-connect path below applies the same preference.
+        if (!reused_paired_handle) {
+            try {
+                preferred_connection_params_request_ = device_.RequestPreferredConnectionParameters(
+                    BluetoothLEPreferredConnectionParameters::ThroughputOptimized());
+                SIMPLEBLE_LOG_INFO(
+                    fmt::format("[{}] pre-connect ThroughputOptimized request issued", address_));
+            } catch (...) {
+                SIMPLEBLE_LOG_WARN(
+                    fmt::format("[{}] pre-connect ThroughputOptimized request THREW (not supported)",
+                                address_));
+            }
         }
     });
 
@@ -163,14 +179,16 @@ void PeripheralWindows::connect() {
     // previous app process that didn't disconnect cleanly, which is the
     // dominant cause of the second-launch failure on certain BLE dongles.
     bool discovery_ok = false;
-    constexpr int kMaxRetries = 6;
-    // 150, 300, 500, 900, 1500 ms — total ~3.3 s worst case.
-    constexpr int kBackoffMs[kMaxRetries - 1] = {150, 300, 500, 900, 1500};
+    constexpr int kMaxRetries = 3;
+    // Each uncached query has a three-second bound. Together with these short
+    // backoffs, an offline device cannot monopolize reconnect for a minute.
+    constexpr int kBackoffMs[kMaxRetries - 1] = {150, 300};
     for (int i = 0; i < kMaxRetries; i++) {
-        if (_attempt_connect(false /* use_cached */)) {
+        if (_attempt_connect(false /* use_cached */, kConnectOperationTimeoutMs)) {
             discovery_ok = true;
             break;
         }
+        if (i + 1 >= kMaxRetries) break;
         std::this_thread::sleep_for(std::chrono::milliseconds(kBackoffMs[i]));
 
         // After 2 failures do a single handle-reset: close the current
@@ -182,14 +200,15 @@ void PeripheralWindows::connect() {
                 fmt::format("[{}] GATT discovery failing; resetting device handle",
                             address_));
             try {
-                MtaManager::get().execute_sync([this]() {
+                MtaManager::get().execute_sync([this, kConnectOperationTimeoutMs]() {
                     _teardown_connection_parameters_watch_locked_mta();
                     if (device_ != nullptr) {
                         try { device_.Close(); } catch (...) {}
                         device_ = nullptr;
                     }
-                    device_ = async_get(BluetoothLEDevice::FromBluetoothAddressAsync(
-                        _str_to_mac_address(address_)));
+                    device_ = async_get_for(
+                        BluetoothLEDevice::FromBluetoothAddressAsync(_str_to_mac_address(address_)),
+                        kConnectOperationTimeoutMs);
                     if (device_ == nullptr) return;
 
                     // Re-issue ThroughputOptimized preference against the fresh
@@ -238,8 +257,11 @@ void PeripheralWindows::connect() {
                     }
                 });
 
-            // Subscribe to ConnectionParametersChanged so we can immediately push
-            // back if Windows extends our interval on a new-device connection.
+            // Subscribe to ConnectionParametersChanged so we can push back if
+            // Windows extends our interval on a new-device connection. The
+            // handler checks the observed interval and has a cooldown; blindly
+            // issuing a new request for every event creates a request/event
+            // feedback loop on some Windows BLE drivers.
             // (Available on Windows 10 version 2004 / 10.0.19041.0+.)
             try {
                 connection_params_changed_token_ = device_.ConnectionParametersChanged(
@@ -255,13 +277,10 @@ void PeripheralWindows::connect() {
                 // API may not exist on this Windows build; not fatal.
             }
 
-            // Initial request + one belt-and-suspenders reapply that doubles as
-            // a sanity check on our logic.
+            // One post-discovery check covers paired handles, for which the
+            // pre-connect request is intentionally skipped.
             _reapply_preferred_connection_parameters_locked_mta();
         });
-
-        // Start the watchdog outside the MTA block so it runs on its own thread.
-        _conn_param_watchdog_start();
 
         if (SimpleBLE::Config::WinRT::use_deferred_disconnect) {
             connection_state_ = ConnectionState::Connected;
@@ -299,9 +318,6 @@ void PeripheralWindows::disconnect() {
         }
         return;
     }
-
-    // Stop watchdog outside MTA so it can flush its own pending reapply.
-    _conn_param_watchdog_stop();
 
     if (SimpleBLE::Config::WinRT::use_deferred_disconnect) {
         // Deferred path
@@ -596,7 +612,7 @@ void PeripheralWindows::_subscribe(BluetoothUUID const& service, BluetoothUUID c
     });
 }
 
-bool PeripheralWindows::_attempt_connect(bool use_cached) {
+bool PeripheralWindows::_attempt_connect(bool use_cached, uint32_t timeout_ms) {
     gatt_map_.clear();
 
     const BluetoothCacheMode cache_mode =
@@ -607,7 +623,7 @@ bool PeripheralWindows::_attempt_connect(bool use_cached) {
     // failing in the user's logs, which otherwise just show the final
     // "GATT service discovery failed after all retries" message).
     try {
-        return MtaManager::get().execute_sync<bool>([this, cache_mode, use_cached]() {
+        return MtaManager::get().execute_sync<bool>([this, cache_mode, use_cached, timeout_ms]() {
         if (device_ == nullptr) {
             SIMPLEBLE_LOG_WARN(
                 fmt::format("[{}] _attempt_connect: device_ is null", address_));
@@ -615,7 +631,7 @@ bool PeripheralWindows::_attempt_connect(bool use_cached) {
         }
         // We need to cache all services, characteristics and descriptors in the class, else
         // the underlying objects will be garbage collected.
-        auto services_result = async_get(device_.GetGattServicesAsync(cache_mode));
+        auto services_result = async_get_for(device_.GetGattServicesAsync(cache_mode), timeout_ms);
         if (services_result.Status() != GattCommunicationStatus::Success) {
             SIMPLEBLE_LOG_WARN(
                 fmt::format("[{}] GetGattServicesAsync failed (cached={}): status={}",
@@ -653,7 +669,7 @@ bool PeripheralWindows::_attempt_connect(bool use_cached) {
             // Fetch the service characteristics (same cache mode as the
             // services fetch for consistency; without this a Cached services
             // fetch but Uncached characteristics fetch can re-fail mid-way).
-            auto characteristics_result = async_get(service.GetCharacteristicsAsync(cache_mode));
+            auto characteristics_result = async_get_for(service.GetCharacteristicsAsync(cache_mode), timeout_ms);
             if (characteristics_result.Status() != GattCommunicationStatus::Success) {
                 SIMPLEBLE_LOG_WARN(
                     fmt::format("[{}] GetCharacteristicsAsync failed (cached={}, service={}): status={}",
@@ -673,7 +689,7 @@ bool PeripheralWindows::_attempt_connect(bool use_cached) {
                 std::string characteristic_uuid = guid_to_uuid(characteristic.Uuid());
 
                 // Fetch the characteristic descriptors (same cache mode).
-                auto descriptors_result = async_get(characteristic.GetDescriptorsAsync(cache_mode));
+                auto descriptors_result = async_get_for(characteristic.GetDescriptorsAsync(cache_mode), timeout_ms);
                 if (descriptors_result.Status() != GattCommunicationStatus::Success) {
                     SIMPLEBLE_LOG_WARN(
                         fmt::format("[{}] GetDescriptorsAsync failed (cached={}, char={}): status={}",
@@ -724,17 +740,26 @@ bool PeripheralWindows::_attempt_connect(bool use_cached) {
     }
 }
 
-// ─── Connection-parameter watchdog (Windows multi-device notify-rate fix) ───
+// ─── Connection-parameter maintenance (Windows multi-device notify-rate fix) ───
 //
 // When a new BLE device connects, the Windows BLE stack renegotiates the
 // connection interval on already-connected devices, often extending it from
 // ~7.5 ms to ~67 ms — which collapses their notify rate from 100 Hz to 15 Hz.
-// `RequestPreferredConnectionParameters(ThroughputOptimized)` alone is not
-// sticky: Windows treats it as a one-shot hint and the next negotiation
-// overrides it. This watchdog re-asserts the preference continuously.
+// Windows may replace the preference during a later negotiation. Re-assert on
+// its change event, but rate-limit requests because some drivers emit that event
+// in response to RequestPreferredConnectionParameters itself.
 
 void PeripheralWindows::_reapply_preferred_connection_parameters_locked_mta() {
     if (device_ == nullptr) return;
+
+    const auto now = std::chrono::steady_clock::now();
+    if (last_connection_parameter_request_.time_since_epoch() !=
+            std::chrono::steady_clock::duration::zero() &&
+        now - last_connection_parameter_request_ <
+            std::chrono::milliseconds(kConnectionParameterRetryCooldownMs)) {
+        return;
+    }
+    last_connection_parameter_request_ = now;
 
     // Reassert MaintainConnection(true) on the persistent session. It's a
     // no-op if already set, but catches the case where Windows silently
@@ -765,15 +790,6 @@ void PeripheralWindows::_reapply_preferred_connection_parameters_locked_mta() {
     }
 }
 
-void PeripheralWindows::_reapply_preferred_connection_parameters() {
-    if (device_ == nullptr) return;
-    try {
-        MtaManager::get().execute_sync([this]() {
-            _reapply_preferred_connection_parameters_locked_mta();
-        });
-    } catch (...) {}
-}
-
 void PeripheralWindows::_teardown_connection_parameters_watch_locked_mta() {
     if (connection_params_changed_token_ && device_ != nullptr) {
         try {
@@ -784,6 +800,7 @@ void PeripheralWindows::_teardown_connection_parameters_watch_locked_mta() {
     // Dropping the request object tells Windows we no longer need the
     // preference held. Safe to call repeatedly.
     preferred_connection_params_request_ = nullptr;
+    last_connection_parameter_request_ = {};
 
     // Release the persistent GattSession. Releasing it also clears
     // MaintainConnection, letting Windows reclaim the resources.
@@ -793,28 +810,6 @@ void PeripheralWindows::_teardown_connection_parameters_watch_locked_mta() {
             gatt_session_.Close();
         } catch (...) {}
         gatt_session_ = nullptr;
-    }
-}
-
-void PeripheralWindows::_conn_param_watchdog_start() {
-    if (conn_param_watchdog_running_.exchange(true)) return;  // already running
-    conn_param_watchdog_thread_ = std::thread([this]() {
-        using namespace std::chrono_literals;
-        // Poll every 500 ms. This is infrequent enough to be cheap but quick
-        // enough that a degraded interval is corrected within ~half a second
-        // of a new device joining.
-        while (conn_param_watchdog_running_.load()) {
-            std::this_thread::sleep_for(500ms);
-            if (!conn_param_watchdog_running_.load()) break;
-            _reapply_preferred_connection_parameters();
-        }
-    });
-}
-
-void PeripheralWindows::_conn_param_watchdog_stop() {
-    if (!conn_param_watchdog_running_.exchange(false)) return;  // already stopped
-    if (conn_param_watchdog_thread_.joinable()) {
-        conn_param_watchdog_thread_.join();
     }
 }
 

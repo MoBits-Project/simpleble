@@ -12,12 +12,12 @@
 #include "winrt/Windows.Devices.Bluetooth.GenericAttributeProfile.h"
 #include "winrt/Windows.Devices.Bluetooth.h"
 
+#include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <atomic>
 #include <map>
 #include <memory>
-#include <thread>
 
 using namespace winrt::Windows::Devices::Bluetooth;
 using namespace winrt::Windows::Devices::Bluetooth::GenericAttributeProfile;
@@ -123,30 +123,17 @@ class PeripheralWindows : public PeripheralBase {
     // get reset when the wrapper is released.
     GattSession gatt_session_{nullptr};
 
-    // Watchdog thread that periodically re-asserts ThroughputOptimized. Belt-
-    // and-suspenders fallback in case ConnectionParametersChanged events are
-    // delivered late or not at all on a given driver / Windows build.
-    std::thread conn_param_watchdog_thread_;
-    std::atomic<bool> conn_param_watchdog_running_{false};
+    // Some drivers raise ConnectionParametersChanged in response to the request
+    // itself. Rate-limit event-driven retries to avoid a feedback loop.
+    static constexpr int64_t kConnectionParameterRetryCooldownMs = 2000;
+    std::chrono::steady_clock::time_point last_connection_parameter_request_{};
 
-    // Target max interval in milliseconds (ThroughputOptimized max is 15 ms).
-    // When the observed ConnectionInterval exceeds this, we re-request.
-    static constexpr int64_t kPreferredMaxIntervalMs = 20;
-
-    // Re-request ThroughputOptimized connection parameters if the current
-    // connection interval exceeds the target. Safe to call concurrently.
-    // Must be invoked via MtaManager::execute_sync (accesses device_).
+    // Re-request ThroughputOptimized connection parameters, subject to the
+    // cooldown above. Must run in an MTA context (accesses device_).
     void _reapply_preferred_connection_parameters_locked_mta();
-    // Public-facing trampoline: submits the reapply task to MtaManager and
-    // returns once it has executed.
-    void _reapply_preferred_connection_parameters();
     // Unregister the ConnectionParametersChanged handler and release the
     // preferred-parameters request. Must run on MTA.
     void _teardown_connection_parameters_watch_locked_mta();
-    // Start / stop the watchdog thread.
-    void _conn_param_watchdog_start();
-    void _conn_param_watchdog_stop();
-
     // Internal state for deferred (non-blocking) disconnect mode
     // Only active when Config::WinRT::use_deferred_disconnect == true
     enum class ConnectionState { Disconnected, Connecting, Connected, Disconnecting };
@@ -167,7 +154,7 @@ class PeripheralWindows : public PeripheralBase {
     // etc. Paired devices have their service structure persisted by Windows, so
     // Cached mode often succeeds on reconnect where Uncached fails (observed
     // with certain third-party BLE dongles).
-    bool _attempt_connect(bool use_cached = false);
+    bool _attempt_connect(bool use_cached, uint32_t timeout_ms);
 
     gatt_characteristic_t& _fetch_characteristic(const BluetoothUUID& service_uuid,
                                                  const BluetoothUUID& characteristic_uuid);
